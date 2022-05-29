@@ -1,5 +1,5 @@
 @echo off
-set executable=zig-out\bin\typeroo.exe
+set executable=zig-out\bin\coro.exe
 if exist %executable% (del %executable%)
 call timecmd zig build
 if exist %executable% (call %executable%)

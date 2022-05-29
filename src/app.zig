@@ -70,8 +70,12 @@ pub const InputState = struct {
 
 const State = enum {
     neutral,
-    new_shape_group,
-    new_shape,
+    group_clicked,
+    group_dragged,
+    group_selected,
+    shape_clicked,
+    shape_dragged,
+    shape_selected,
 };
 
 pub const App = struct {
@@ -86,6 +90,7 @@ pub const App = struct {
     inputs: InputState = .{},
     load_data: []u8 = undefined,
     groups: std.ArrayList(ShapeGroup),
+    state: State = .neutral,
     last_click_ticks: u32 = 0,
     last_group_offset: Vector2 = .{},
     last_group_index: ?usize = null,
@@ -174,10 +179,164 @@ pub const App = struct {
     pub fn update(self: *Self, ticks: u32, arena: std.mem.Allocator) void {
         self.ticks = ticks;
         self.arena = arena;
+        const prev_state = self.state;
         self.handle_mouse_inputs();
+        if (prev_state != self.state) helpers.debug_print("state change from {s} to {s}\n", .{ @tagName(prev_state), @tagName(self.state) });
     }
 
     pub fn handle_mouse_inputs(self: *Self) void {
+        const mouse_pos = self.inputs.mouse.current_pos;
+        defer {
+            if (self.inputs.mouse.l_button.is_clicked) self.last_click_ticks = self.ticks;
+        }
+        switch (self.state) {
+            .neutral => {
+                // if we click on a group, go to group_clicked
+                if (self.inputs.mouse.l_button.is_clicked) {
+                    var index: ?usize = null;
+                    for (self.groups.items) |group, i| {
+                        if (group.contains_point(mouse_pos)) {
+                            // we don't break because we want to repect z ordering.
+                            index = i;
+                        }
+                    }
+                    if (index) |i| {
+                        self.last_group_index = i;
+                        self.last_group_offset = mouse_pos.subtracted(self.groups.items[i].position).negated();
+                        self.state = .group_clicked;
+                    }
+                }
+            },
+            .group_clicked => {
+                // if we move the mouse while it is still down, we are dragging the group
+                // if we click again without moving in the timeframe, we are selecting the group
+                // if we do neither, and the timeframe passed, we go back to neutral.
+                std.debug.assert(self.last_group_index != null);
+                const index = self.last_group_index.?;
+                const group = &self.groups.items[index];
+                _ = group;
+                if (!self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_clicked and (self.ticks - self.last_click_ticks) < DOUBLE_CLICK_TICKS) {
+                    self.last_group_index = null;
+                    self.active_group_index = index;
+                    self.groups.items[index].set_active(true);
+                    self.state = .group_selected;
+                } else if (self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_down) {
+                    self.state = .group_dragged;
+                } else if (self.ticks - self.last_click_ticks > DOUBLE_CLICK_TICKS) {
+                    // we are still in this state, and not clicked again in time, go back to neutral
+                    self.last_group_index = null;
+                    self.state = .neutral;
+                }
+            },
+            .group_dragged => {
+                // if we release the mouse, go back to neutral.
+                std.debug.assert(self.last_group_index != null);
+                const index = self.last_group_index.?;
+                const group = &self.groups.items[index];
+                if (!self.inputs.mouse.l_button.is_down) {
+                    // we have released the mouse, go back to neutral
+                    self.last_group_index = null;
+                    self.state = .neutral;
+                } else {
+                    // move the group to the mouse position
+                    group.position = mouse_pos.added(self.last_group_offset);
+                    group.recalculate_bounding_box();
+                }
+            },
+            .group_selected => {
+                // if we click outside the bounds of the active_group, go back to neutral
+                // if we click on a shape in bounds, go to shape_clicked
+                std.debug.assert(self.active_group_index != null);
+                const agi = self.active_group_index.?;
+                const group = &self.groups.items[agi];
+                if (self.inputs.mouse.l_button.is_clicked) {
+                    if (!group.contains_point(mouse_pos)) {
+                        // clicked outside bounds. go back to neutral
+                        group.set_active(false);
+                        self.active_group_index = null;
+                        self.state = .neutral;
+                    } else {
+                        // if we click on a shape, go to shape_clicked
+                        var index: ?usize = null;
+                        for (group.shapes.items) |shape, i| {
+                            if (shape.contains_point(mouse_pos.subtracted(group.position))) {
+                                index = i;
+                            }
+                        }
+                        if (index) |i| {
+                            self.last_shape_index = i;
+                            self.state = .shape_clicked;
+                            self.last_shape_offset = mouse_pos.subtracted(group.shapes.items[i].position).negated();
+                        }
+                    }
+                }
+            },
+            .shape_clicked => {
+                // if we click again without moving in the timeframe, shape_selected
+                // if we move the mouse without releasing the go to dragging
+                // if we wait for too long, go back to group_selected
+                std.debug.assert(self.active_group_index != null);
+                std.debug.assert(self.last_shape_index != null);
+                const agi = self.active_group_index.?;
+                const lsi = self.last_shape_index.?;
+                const group = &self.groups.items[agi];
+                const shape = &group.shapes.items[lsi];
+                if (!self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_clicked and (self.ticks - self.last_click_ticks) < DOUBLE_CLICK_TICKS) {
+                    // shape is selected
+                    self.last_shape_index = null;
+                    self.active_shape_index = lsi;
+                    shape.set_active(true);
+                    self.state = .shape_selected;
+                } else if (self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_down) {
+                    // shape is dragged
+                    self.state = .shape_dragged;
+                } else if (self.ticks - self.last_click_ticks > DOUBLE_CLICK_TICKS) {
+                    // back to group_selected
+                    self.last_shape_index = null;
+                    self.state = .group_selected;
+                }
+            },
+            .shape_dragged => {
+                // if we release the mouse, go back to group_selected.
+                std.debug.assert(self.active_group_index != null);
+                std.debug.assert(self.last_shape_index != null);
+                const agi = self.active_group_index.?;
+                const lsi = self.last_shape_index.?;
+                const group = &self.groups.items[agi];
+                const shape = &group.shapes.items[lsi];
+                if (!self.inputs.mouse.l_button.is_down) {
+                    // we have released the mouse, go back to neutral
+                    self.last_group_index = null;
+                    self.state = .group_selected;
+                } else {
+                    // move the group to the mouse position
+                    shape.position = mouse_pos.added(self.last_shape_offset);
+                    group.recalculate_bounding_box();
+                }
+            },
+            .shape_selected => {
+                // if we click outside the bounds of the shape, go back to group_selected
+                std.debug.assert(self.active_group_index != null);
+                std.debug.assert(self.active_shape_index != null);
+                const agi = self.active_group_index.?;
+                const asi = self.active_shape_index.?;
+                const group = &self.groups.items[agi];
+                const shape = &group.shapes.items[asi];
+                if (self.inputs.mouse.l_button.is_clicked) {
+                    if (shape.contains_point(mouse_pos.subtracted(group.position))) {
+                        // clicked in the shape
+                    } else {
+                        // clicked outside, deselect shape
+                        shape.set_active(false);
+                        self.active_shape_index = null;
+                        self.state = .group_selected;
+                    }
+                }
+            },
+        }
+    }
+
+    pub fn handle_mouse_inputs_plain(self: *Self) void {
         const mouse_pos = self.inputs.mouse.current_pos;
         if (self.inputs.mouse.l_button.is_clicked) {
             defer self.last_click_ticks = self.ticks;
