@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Hi from Zig</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <div class="page">
+    <div class="container">
+      <div class="col">
+        <div class="wrapper">
+          <canvas id="webgl_canvas" width="1600" height="900"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+  </script>
+  <script src="interface.js"></script>
+  <script>
+
+    const env = { ...api };
+
+    fetchAndInstantiate('typeroo.wasm', { env }).then(instance => {
+      memory = instance.exports.memory;
+      instance.exports.web_init();
+      const web_render = instance.exports.web_render;
+      // document.addEventListener('keydown', e => instance.exports.onKeyDown(e.keyCode, 1));
+      // document.addEventListener('keyup', e => instance.exports.onKeyUp(e.keyCode, 0));
+      document.addEventListener('mousedown', e => instance.exports.mouse_down(e.button));
+      document.addEventListener('mouseup', e => instance.exports.mouse_up(e.button));
+      document.addEventListener('mousemove', e => instance.exports.mouse_motion(e.x, e.y));
+      // document.addEventListener('resize', e => instance.exports.onResize(e.width, e.height));
+
+      function render() {
+        web_render();
+        window.requestAnimationFrame(render);
+      }
+      window.requestAnimationFrame(render);
+    });
+
+    function fetchAndInstantiate(url, importObject) {
+      return fetch(url)
+        .then(response => response.arrayBuffer())
+        .then(bytes => WebAssembly.instantiate(bytes, importObject))
+        .then(results => results.instance);
+    }
+  </script>
+</body>
+
+</html>

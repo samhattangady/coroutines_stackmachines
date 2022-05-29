@@ -1,0 +1,7 @@
+*.swp
+*~
+*.*~
+SDL2.dll
+zig-cache/
+zig-out/
+*.wasm
