@@ -17,6 +17,10 @@ const MouseState = helpers.MouseState;
 const EditableText = helpers.EditableText;
 const TYPING_BUFFER_SIZE = 16;
 const DOUBLE_CLICK_TICKS = 200;
+const MAX_NUM_COROUTINES = 128;
+const DEBUG_COROUTINES = true;
+const SUPER_DEBUG_COROUTINES = DEBUG_COROUTINES and false;
+const SUPER_DEBUG_COROUTINES2 = DEBUG_COROUTINES and false;
 
 const InputKey = enum {
     shift,
@@ -78,6 +82,74 @@ const State = enum {
     shape_selected,
 };
 
+const Coroutine = struct {
+    frame: anyframe = undefined,
+    data: []u8 = undefined,
+    name: []const u8 = undefined,
+    used: bool = false,
+    done: bool = false,
+};
+const CoroutineStack = struct {
+    const Self = @This();
+    coroutines: []Coroutine,
+    allocator: std.mem.Allocator,
+    stack_size: usize = 0,
+    // TODO (17 Dec 2021 sam): Keep a count of how many coros are touched / dirty / used
+    // We don't want to keep looping through all every single frame @@Performance
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        // We use a fixed allocation because we don't want to be dealing with pointer updates
+        // if we have to grow the stack at any point.
+        var coroutines = allocator.alloc(Coroutine, MAX_NUM_COROUTINES) catch unreachable;
+        for (coroutines) |*coro| {
+            coro.used = false;
+            coro.done = false;
+        }
+        return Self{
+            .coroutines = coroutines,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.coroutines) |*coro| {
+            if (coro.used) self.allocator.free(coro.data);
+        }
+        self.allocator.free(self.coroutines);
+    }
+
+    pub fn new_coroutine(self: *Self, comptime function: anytype) *Coroutine {
+        var coro: *Coroutine = undefined;
+        var out_of_space = false;
+        for (self.coroutines) |*coroutine, i| {
+            if (coroutine.used and i == MAX_NUM_COROUTINES - 1) out_of_space = true;
+            if (coroutine.used) continue;
+            if (i > self.stack_size) self.stack_size = i;
+            coro = coroutine;
+            break;
+        }
+        if (out_of_space) {
+            unreachable; // we tried to add too many stacks onto the coroutine stack.
+        }
+        coro.data = self.allocator.allocAdvanced(u8, @alignOf(@Frame(function)), @sizeOf(@Frame(function)), .at_least) catch unreachable;
+        coro.used = true;
+        coro.done = false;
+        return coro;
+    }
+
+    pub fn cleanup(self: *Self) void {
+        for (self.coroutines) |*coroutine, i| {
+            if (coroutine.done) {
+                coroutine.used = false;
+                coroutine.done = false;
+                self.allocator.free(coroutine.data);
+            }
+            if (i > self.stack_size) break;
+            // TODO (20 Dec 2021 sam): Shrink the stack_size when requried.
+        }
+    }
+};
+
 pub const App = struct {
     const Self = @This();
     typesetter: TypeSetter = undefined,
@@ -90,6 +162,8 @@ pub const App = struct {
     inputs: InputState = .{},
     load_data: []u8 = undefined,
     groups: std.ArrayList(ShapeGroup),
+    coroutines: CoroutineStack = undefined,
+    active_coroutine: ?anyframe = null,
     state: State = .neutral,
     last_click_ticks: u32 = 0,
     last_group_offset: Vector2 = .{},
@@ -109,6 +183,7 @@ pub const App = struct {
 
     pub fn init(self: *Self) !void {
         try self.typesetter.init(&self.camera, self.allocator);
+        self.coroutines = CoroutineStack.init(self.allocator);
         {
             {
                 var group = ShapeGroup.init(self.allocator);
@@ -159,6 +234,7 @@ pub const App = struct {
         for (self.groups.items) |*group| group.deinit();
         self.groups.deinit();
         self.typesetter.deinit();
+        self.coroutines.deinit();
     }
 
     pub fn handle_inputs(self: *Self, event: c.SDL_Event) void {
@@ -180,11 +256,254 @@ pub const App = struct {
         self.ticks = ticks;
         self.arena = arena;
         const prev_state = self.state;
-        self.handle_mouse_inputs();
+        self.handle_mouse_inputs_coroutines();
         if (prev_state != self.state) helpers.debug_print("state change from {s} to {s}\n", .{ @tagName(prev_state), @tagName(self.state) });
     }
 
-    pub fn handle_mouse_inputs(self: *Self) void {
+    pub fn handle_mouse_inputs_coroutines(self: *Self) void {
+        if (self.active_coroutine) |frame| {
+            if (SUPER_DEBUG_COROUTINES2) {
+                // not the most effecient, but can work if required...
+                for (self.coroutines.coroutines) |coro| {
+                    if (coro.frame == frame) std.debug.print("in {s}\n", .{coro.name});
+                }
+            }
+            resume frame;
+        } else {
+            // this is the behaviour of .neutral state. If we want, we can make it a coroutine as well...
+            if (self.inputs.mouse.l_button.is_clicked) {
+                const mouse_pos = self.inputs.mouse.current_pos;
+                var index: ?usize = null;
+                for (self.groups.items) |group, i| {
+                    if (group.contains_point(mouse_pos)) {
+                        // we don't break because we want to repect z ordering.
+                        index = i;
+                    }
+                }
+                if (index) |i| {
+                    const offset = mouse_pos.subtracted(self.groups.items[i].position).negated();
+                    var coro = self.coroutines.new_coroutine(Self.group_clicked_mode);
+                    var bytes = @alignCast(@alignOf(@Frame(Self.group_clicked_mode)), coro.data);
+                    _ = @asyncCall(bytes, {}, self.group_clicked_mode, .{ coro, i, offset });
+                }
+            }
+        }
+    }
+
+    // This doesn't compile -> error: runtime value cannot be passed to comptime arg
+    // syntax sugar...
+    fn start_coroutine(self: *Self, fn_def: anytype, func: anytype, data: anytype) void {
+        var coro = self.coroutines.new_coroutine(fn_def);
+        var bytes = @alignCast(@alignOf(@Frame(fn_def)), coro.data);
+        // TODO (31 May 2022 sam): How can we pass in coro along with the data that we are being passed?
+        // self.coro = coro; // ugly.
+        _ = @asyncCall(bytes, {}, func, data);
+    }
+
+    inline fn debug_enter_coroutine(self: *Self, str: []const u8) void {
+        _ = self;
+        if (DEBUG_COROUTINES) helpers.debug_print("entering {s}\n", .{str});
+    }
+
+    inline fn debug_leave_coroutine(self: *Self, str: []const u8) void {
+        _ = self;
+        if (DEBUG_COROUTINES) helpers.debug_print("leaving  {s}\n", .{str});
+    }
+
+    fn group_clicked_mode(self: *Self, coro: *Coroutine, group_index: usize, offset: Vector2) void {
+        // if we move the mouse while it is still down, we are dragging the group
+        // if we click again without moving in the timeframe, we are selecting the group
+        // if we do neither, and the timeframe passed, we go back to neutral.
+        self.debug_enter_coroutine(@src().fn_name);
+        defer self.debug_leave_coroutine(@src().fn_name);
+        const prev_coro = self.active_coroutine;
+        defer self.active_coroutine = prev_coro;
+        defer coro.done = true;
+        coro.frame = @frame();
+        coro.name = @src().fn_name;
+        self.active_coroutine = @frame();
+        const last_click_ticks = self.ticks;
+        while (true) {
+            suspend {}
+            if (SUPER_DEBUG_COROUTINES) std.debug.print("in {s}\n", .{@src().fn_name});
+            if (!self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_clicked and (self.ticks - last_click_ticks) < DOUBLE_CLICK_TICKS) {
+                var new_coro = self.coroutines.new_coroutine(Self.group_selected_mode);
+                var bytes = @alignCast(@alignOf(@Frame(Self.group_selected_mode)), new_coro.data);
+                _ = @asyncCall(bytes, {}, self.group_selected_mode, .{ new_coro, group_index });
+            } else if (self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_down) {
+                var new_coro = self.coroutines.new_coroutine(Self.group_dragged_mode);
+                var bytes = @alignCast(@alignOf(@Frame(Self.group_dragged_mode)), new_coro.data);
+                _ = @asyncCall(bytes, {}, self.group_dragged_mode, .{ new_coro, group_index, offset });
+            } else if (self.ticks - last_click_ticks > DOUBLE_CLICK_TICKS) {
+                // we are still in this state, and not clicked again in time, go back to neutral
+                break;
+            }
+        }
+    }
+
+    fn group_dragged_mode(self: *Self, coro: *Coroutine, group_index: usize, offset: Vector2) void {
+        // if we release the mouse, go back to neutral.
+        // if we move the mouse, move the group
+        self.debug_enter_coroutine(@src().fn_name);
+        defer self.debug_leave_coroutine(@src().fn_name);
+        const prev_coro = self.active_coroutine;
+        defer self.active_coroutine = prev_coro;
+        defer coro.done = true;
+        coro.frame = @frame();
+        coro.name = @src().fn_name;
+        self.active_coroutine = @frame();
+        while (true) {
+            suspend {}
+            if (SUPER_DEBUG_COROUTINES) std.debug.print("in {s}\n", .{@src().fn_name});
+            const mouse_pos = self.inputs.mouse.current_pos;
+            const group = &self.groups.items[group_index];
+            if (self.inputs.mouse.l_button.is_down) {
+                // move the group to the mouse position
+                group.position = mouse_pos.added(offset);
+                group.recalculate_bounding_box();
+            } else {
+                // we have released the mouse, go back to neutral
+                break;
+            }
+        }
+    }
+
+    fn group_selected_mode(self: *Self, coro: *Coroutine, group_index: usize) void {
+        // if we click outside the bounds of the active_group, go back to neutral
+        // if we click on a shape in bounds, go to shape_clicked
+        self.debug_enter_coroutine(@src().fn_name);
+        defer self.debug_leave_coroutine(@src().fn_name);
+        const prev_coro = self.active_coroutine;
+        defer self.active_coroutine = prev_coro;
+        defer coro.done = true;
+        coro.frame = @frame();
+        coro.name = @src().fn_name;
+        self.active_coroutine = @frame();
+        self.groups.items[group_index].set_active(true);
+        // we benefit from cleanups with defer.
+        defer self.groups.items[group_index].set_active(false);
+        const group = &self.groups.items[group_index];
+        while (true) {
+            suspend {}
+            if (SUPER_DEBUG_COROUTINES) std.debug.print("in {s}\n", .{@src().fn_name});
+            const mouse_pos = self.inputs.mouse.current_pos;
+            if (self.inputs.mouse.l_button.is_clicked) {
+                if (!group.contains_point(mouse_pos)) {
+                    // clicked outside bounds. go back to neutral
+                    break;
+                } else {
+                    // if we click on a shape, go to shape_clicked
+                    var index: ?usize = null;
+                    for (group.shapes.items) |shape, i| {
+                        if (shape.contains_point(mouse_pos.subtracted(group.position))) {
+                            index = i;
+                        }
+                    }
+                    if (index) |i| {
+                        const offset = mouse_pos.subtracted(group.shapes.items[i].position).negated();
+                        var new_coro = self.coroutines.new_coroutine(Self.shape_clicked_mode);
+                        var bytes = @alignCast(@alignOf(@Frame(Self.shape_clicked_mode)), new_coro.data);
+                        _ = @asyncCall(bytes, {}, self.shape_clicked_mode, .{ new_coro, group_index, i, offset });
+                    }
+                }
+            }
+        }
+    }
+
+    fn shape_clicked_mode(self: *Self, coro: *Coroutine, group_index: usize, shape_index: usize, offset: Vector2) void {
+        // if we click again without moving in the timeframe, shape_selected
+        // if we move the mouse without releasing the go to dragging
+        // if we wait for too long, go back to group_selected
+        self.debug_enter_coroutine(@src().fn_name);
+        defer self.debug_leave_coroutine(@src().fn_name);
+        const prev_coro = self.active_coroutine;
+        defer self.active_coroutine = prev_coro;
+        defer coro.done = true;
+        coro.frame = @frame();
+        coro.name = @src().fn_name;
+        self.active_coroutine = @frame();
+        const last_click_ticks = self.ticks;
+        const group = &self.groups.items[group_index];
+        const shape = &group.shapes.items[shape_index];
+        _ = shape;
+        while (true) {
+            suspend {}
+            if (SUPER_DEBUG_COROUTINES) std.debug.print("in {s}\n", .{@src().fn_name});
+            if (!self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_clicked and (self.ticks - last_click_ticks) < DOUBLE_CLICK_TICKS) {
+                var new_coro = self.coroutines.new_coroutine(Self.shape_selected_mode);
+                var bytes = @alignCast(@alignOf(@Frame(Self.shape_selected_mode)), new_coro.data);
+                _ = @asyncCall(bytes, {}, self.shape_selected_mode, .{ new_coro, group_index, shape_index });
+            } else if (self.inputs.mouse.l_moved() and self.inputs.mouse.l_button.is_down) {
+                var new_coro = self.coroutines.new_coroutine(Self.shape_dragged_mode);
+                var bytes = @alignCast(@alignOf(@Frame(Self.shape_dragged_mode)), new_coro.data);
+                _ = @asyncCall(bytes, {}, self.shape_dragged_mode, .{ new_coro, group_index, shape_index, offset });
+            } else if (self.ticks - last_click_ticks > DOUBLE_CLICK_TICKS) {
+                // we are still in this state, and not clicked again in time, go back to neutral
+                break;
+            }
+        }
+    }
+
+    fn shape_dragged_mode(self: *Self, coro: *Coroutine, group_index: usize, shape_index: usize, offset: Vector2) void {
+        // if we release the mouse, go back to neutral.
+        // if we move the mouse, move the group
+        self.debug_enter_coroutine(@src().fn_name);
+        defer self.debug_leave_coroutine(@src().fn_name);
+        const prev_coro = self.active_coroutine;
+        defer self.active_coroutine = prev_coro;
+        defer coro.done = true;
+        coro.frame = @frame();
+        coro.name = @src().fn_name;
+        self.active_coroutine = @frame();
+        while (true) {
+            suspend {}
+            if (SUPER_DEBUG_COROUTINES) std.debug.print("in {s}\n", .{@src().fn_name});
+            const mouse_pos = self.inputs.mouse.current_pos;
+            const group = &self.groups.items[group_index];
+            const shape = &group.shapes.items[shape_index];
+            if (self.inputs.mouse.l_button.is_down) {
+                // move the group to the mouse position
+                shape.position = mouse_pos.added(offset);
+                group.recalculate_bounding_box();
+            } else {
+                // we have released the mouse, go back to neutral
+                break;
+            }
+        }
+    }
+
+    fn shape_selected_mode(self: *Self, coro: *Coroutine, group_index: usize, shape_index: usize) void {
+        // if we click outside the bounds of the active_group, go back to neutral
+        // if we click on a shape in bounds, go to shape_clicked
+        self.debug_enter_coroutine(@src().fn_name);
+        defer self.debug_leave_coroutine(@src().fn_name);
+        const prev_coro = self.active_coroutine;
+        defer self.active_coroutine = prev_coro;
+        defer coro.done = true;
+        coro.frame = @frame();
+        coro.name = @src().fn_name;
+        self.active_coroutine = @frame();
+        self.groups.items[group_index].shapes.items[shape_index].set_active(true);
+        // we benefit from cleanups with defer.
+        defer self.groups.items[group_index].shapes.items[shape_index].set_active(false);
+        const group = &self.groups.items[group_index];
+        const shape = &group.shapes.items[shape_index];
+        while (true) {
+            suspend {}
+            if (SUPER_DEBUG_COROUTINES) std.debug.print("in {s}\n", .{@src().fn_name});
+            const mouse_pos = self.inputs.mouse.current_pos;
+            if (self.inputs.mouse.l_button.is_clicked) {
+                if (!shape.contains_point(mouse_pos)) {
+                    // clicked outside shape. deselect shape
+                    break;
+                } else {
+                    // clicked in the shape.
+                }
+            }
+        }
+    }
+
+    pub fn handle_mouse_inputs_state_machine(self: *Self) void {
         const mouse_pos = self.inputs.mouse.current_pos;
         defer {
             if (self.inputs.mouse.l_button.is_clicked) self.last_click_ticks = self.ticks;
